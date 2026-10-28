@@ -1,4 +1,4 @@
-//! The two user settings (in %APPDATA%\VRAM Bloat Killer\settings.ini) and the
+//! User settings (in %APPDATA%\VRAM Bloat Killer\settings.ini) and the
 //! Start with Windows switch (a value under HKCU\...\Run).
 
 use std::path::PathBuf;
@@ -9,18 +9,31 @@ use windows::Win32::System::Registry::{
     RegDeleteKeyValueW, RegGetValueW, RegSetKeyValueW, HKEY_CURRENT_USER, REG_SZ, RRF_RT_REG_SZ,
 };
 
-pub const LIMITS_GB: [f64; 6] = [1.0, 2.0, 3.0, 4.0, 6.0, 8.0];
+pub const WARN_GB: [f64; 6] = [1.0, 2.0, 3.0, 4.0, 6.0, 8.0];
+pub const GROWTH_GB: [f64; 4] = [1.0, 2.0, 3.0, 4.0];
+pub const KILL_GB: [f64; 8] = [2.0, 3.0, 4.0, 6.0, 8.0, 10.0, 12.0, 16.0];
+/// Under five minutes, Chromium may give up on hardware acceleration.
+pub const COOLDOWN_MIN: [u64; 4] = [5, 10, 30, 60];
+
 const RUN_KEY: PCWSTR = w!("Software\\Microsoft\\Windows\\CurrentVersion\\Run");
 const RUN_VALUE: PCWSTR = w!("VRAM Bloat Killer");
 
 pub struct Settings {
-    pub limit_gb: f64,
-    pub auto_restart: bool,
+    /// Notify above this (browsers: total GPU memory; other apps: borrowed RAM).
+    pub warn_gb: f64,
+    /// Notify when an app climbs this much in 30 minutes without dropping.
+    pub growth_gb: f64,
+    /// Kill above this much total GPU memory; None is off.
+    pub kill_gb: Option<f64>,
+    /// Let auto-kill close non-browser apps entirely.
+    pub kill_apps: bool,
+    /// Minimum minutes between auto-kills of the same app.
+    pub cooldown_min: u64,
 }
 
 impl Default for Settings {
     fn default() -> Self {
-        Self { limit_gb: 3.0, auto_restart: false }
+        Self { warn_gb: 3.0, growth_gb: 2.0, kill_gb: None, kill_apps: false, cooldown_min: 10 }
     }
 }
 
@@ -29,15 +42,14 @@ impl Settings {
         let mut s = Self::default();
         let Ok(text) = std::fs::read_to_string(file()) else { return s };
         for line in text.lines() {
-            match line.split_once('=').map(|(k, v)| (k.trim(), v.trim())) {
-                Some(("limit_gb", v)) => {
-                    if let Ok(gb) = v.parse::<f64>() {
-                        if gb > 0.0 {
-                            s.limit_gb = gb;
-                        }
-                    }
-                }
-                Some(("auto_restart", v)) => s.auto_restart = v == "true",
+            let Some((k, v)) = line.split_once('=').map(|(k, v)| (k.trim(), v.trim())) else { continue };
+            let gb = v.parse::<f64>().ok().filter(|g| *g >= 0.0);
+            match k {
+                "warn_gb" => s.warn_gb = gb.filter(|g| *g > 0.0).unwrap_or(s.warn_gb),
+                "growth_gb" => s.growth_gb = gb.filter(|g| *g > 0.0).unwrap_or(s.growth_gb),
+                "kill_gb" => s.kill_gb = gb.filter(|g| *g > 0.0),
+                "kill_apps" => s.kill_apps = v == "true",
+                "cooldown_min" => s.cooldown_min = v.parse().unwrap_or(s.cooldown_min).max(1),
                 _ => {}
             }
         }
@@ -49,7 +61,15 @@ impl Settings {
         if let Some(dir) = path.parent() {
             let _ = std::fs::create_dir_all(dir);
         }
-        let _ = std::fs::write(path, format!("limit_gb={}\nauto_restart={}\n", self.limit_gb, self.auto_restart));
+        let text = format!(
+            "warn_gb={}\ngrowth_gb={}\nkill_gb={}\nkill_apps={}\ncooldown_min={}\n",
+            self.warn_gb,
+            self.growth_gb,
+            self.kill_gb.unwrap_or(0.0),
+            self.kill_apps,
+            self.cooldown_min
+        );
+        let _ = std::fs::write(path, text);
     }
 }
 

@@ -1,8 +1,8 @@
 [package]
 name = "vram-bloat-killer"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
-description = "A Windows tray watchdog that catches browser GPU processes hoarding memory and restarts them without closing a tab."
+description = "A Windows tray watchdog that catches GPU memory bloat in any app, and restarts browser GPU processes without closing a tab."
 license = "MIT"
 authors = ["LordBonds"]
 repository = "https://github.com/LordBonds/vram-bloat-killer"
@@ -13,6 +13,7 @@ features = [
     "Wdk_System_Threading",
     "Win32_Foundation",
     "Win32_Graphics_Gdi",
+    "Win32_System_Diagnostics_ToolHelp",
     "Win32_System_LibraryLoader",
     "Win32_System_Performance",
     "Win32_Security",

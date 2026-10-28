@@ -1,11 +1,15 @@
-//! Reads per-process GPU memory from Windows performance counters and finds the
-//! Chromium-family GPU processes (browsers, Electron apps, WebView2) among them.
+//! Reads per-process GPU memory from Windows performance counters for every process,
+//! and marks the Chromium-family GPU processes (browsers, Electron apps, WebView2):
+//! the only ones that can be restarted without closing the app.
 
 use std::collections::HashMap;
 
 use windows::core::{w, PCWSTR, PWSTR};
 use windows::Wdk::System::Threading::{NtQueryInformationProcess, PROCESSINFOCLASS};
 use windows::Win32::Foundation::{CloseHandle, HANDLE, UNICODE_STRING};
+use windows::Win32::System::Diagnostics::ToolHelp::{
+    CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W, TH32CS_SNAPPROCESS,
+};
 use windows::Win32::System::Performance::*;
 use windows::Win32::System::Threading::{
     OpenProcess, QueryFullProcessImageNameW, TerminateProcess, PROCESS_NAME_WIN32,
@@ -27,6 +31,8 @@ pub struct GpuProcess {
     pub shared: u64,
     /// Memory on the graphics card itself.
     pub dedicated: u64,
+    /// A Chromium/Electron GPU process: its app relaunches it, so killing it is safe.
+    pub restartable: bool,
 }
 
 impl GpuProcess {
@@ -43,8 +49,8 @@ pub struct Sampler {
     query: isize,
     shared: isize,
     dedicated: isize,
-    /// pid -> app name if it is a GPU process, None if it is anything else.
-    known: HashMap<u32, Option<String>>,
+    /// pid -> (app name, restartable), looked up once per process.
+    known: HashMap<u32, (String, bool)>,
 }
 
 impl Sampler {
@@ -66,7 +72,7 @@ impl Sampler {
         }
     }
 
-    /// Every GPU process holding at least 32 MB, largest first.
+    /// Every process holding at least 32 MB of GPU memory, largest first.
     pub fn sample(&mut self) -> Vec<GpuProcess> {
         if unsafe { PdhCollectQueryData(self.query) } != 0 {
             return Vec::new();
@@ -87,10 +93,10 @@ impl Sampler {
         self.known.retain(|pid, _| by_pid.contains_key(pid));
         let mut out: Vec<GpuProcess> = by_pid
             .into_iter()
-            .filter(|(_, (s, d))| s + d >= MIN_TRACKED)
-            .filter_map(|(pid, (shared, dedicated))| {
-                let app = self.known.entry(pid).or_insert_with(|| identify(pid)).clone()?;
-                Some(GpuProcess { pid, app, shared, dedicated })
+            .filter(|(pid, (s, d))| *pid != 0 && s + d >= MIN_TRACKED)
+            .map(|(pid, (shared, dedicated))| {
+                let (app, restartable) = self.known.entry(pid).or_insert_with(|| identify(pid)).clone();
+                GpuProcess { pid, app, shared, dedicated, restartable }
             })
             .collect();
         out.sort_by(|a, b| b.total().cmp(&a.total()));
@@ -117,6 +123,31 @@ pub fn restart(pid: u32) -> bool {
         let _ = CloseHandle(h);
         ok
     }
+}
+
+/// Closes a whole app. Checks the pid still belongs to `app` so a recycled pid is never hit.
+pub fn close_app(pid: u32, app: &str) -> bool {
+    if !closable(app) {
+        return false;
+    }
+    unsafe {
+        let Ok(h) = OpenProcess(PROCESS_TERMINATE | PROCESS_QUERY_LIMITED_INFORMATION, false, pid) else {
+            return false;
+        };
+        let same = image_stem(h).is_some_and(|stem| friendly_name(&stem) == app);
+        let ok = same && TerminateProcess(h, 1).is_ok();
+        let _ = CloseHandle(h);
+        ok
+    }
+}
+
+/// Windows' own processes, and anything that couldn't be identified, are never closed.
+pub fn closable(app: &str) -> bool {
+    const NEVER: [&str; 12] = [
+        "desktop window manager", "explorer", "csrss", "winlogon", "lsass", "services", "smss",
+        "svchost", "system", "fontdrvhost", "searchhost", "vram-bloat-killer",
+    ];
+    !app.starts_with("Process ") && !NEVER.contains(&app.to_ascii_lowercase().as_str())
 }
 
 fn pdh(status: u32, what: &str) -> Result<(), String> {
@@ -157,12 +188,42 @@ fn instance_pid(name: &str) -> Option<u32> {
     name.strip_prefix("pid_")?.split('_').next()?.parse().ok()
 }
 
-fn identify(pid: u32) -> Option<String> {
+/// Protected and elevated processes can't be opened; they are named from the
+/// process list instead and are never restartable.
+fn identify(pid: u32) -> (String, bool) {
     unsafe {
-        let h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid).ok()?;
-        let app = if is_gpu_process(h) { image_stem(h) } else { None };
+        let Ok(h) = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) else {
+            return (snapshot_name(pid).unwrap_or_else(|| format!("Process {pid}")), false);
+        };
+        let restartable = is_gpu_process(h);
+        let app = image_stem(h).map(|stem| friendly_name(&stem)).unwrap_or_else(|| format!("Process {pid}"));
         let _ = CloseHandle(h);
-        app.map(|stem| friendly_name(&stem))
+        (app, restartable)
+    }
+}
+
+unsafe fn snapshot_name(pid: u32) -> Option<String> {
+    let snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0).ok()?;
+    let mut entry = PROCESSENTRY32W { dwSize: std::mem::size_of::<PROCESSENTRY32W>() as u32, ..Default::default() };
+    let mut found = None;
+    let mut more = Process32FirstW(snap, &mut entry).is_ok();
+    while more {
+        if entry.th32ProcessID == pid {
+            let len = entry.szExeFile.iter().position(|&c| c == 0).unwrap_or(entry.szExeFile.len());
+            let file = String::from_utf16_lossy(&entry.szExeFile[..len]);
+            found = Some(friendly_name(strip_exe(&file)));
+            break;
+        }
+        more = Process32NextW(snap, &mut entry).is_ok();
+    }
+    let _ = CloseHandle(snap);
+    found
+}
+
+fn strip_exe(file: &str) -> &str {
+    match file.len().checked_sub(4) {
+        Some(n) if file.is_char_boundary(n) && file[n..].eq_ignore_ascii_case(".exe") => &file[..n],
+        _ => file,
     }
 }
 
@@ -192,11 +253,7 @@ unsafe fn image_stem(h: HANDLE) -> Option<String> {
     let mut size = buf.len() as u32;
     QueryFullProcessImageNameW(h, PROCESS_NAME_WIN32, PWSTR(buf.as_mut_ptr()), &mut size).ok()?;
     let path = String::from_utf16_lossy(&buf[..size as usize]);
-    let file = path.rsplit('\\').next()?;
-    Some(match file.len().checked_sub(4) {
-        Some(n) if file[n..].eq_ignore_ascii_case(".exe") => file[..n].to_string(),
-        _ => file.to_string(),
-    })
+    Some(strip_exe(path.rsplit('\\').next()?).to_string())
 }
 
 fn friendly_name(stem: &str) -> String {
@@ -215,6 +272,8 @@ fn friendly_name(stem: &str) -> String {
         "msedgewebview2" => "WebView2",
         "steamwebhelper" => "Steam",
         "claude" => "Claude",
+        "java" | "javaw" => "Java",
+        "dwm" => "Desktop Window Manager",
         _ => return stem.to_string(),
     }
     .to_string()
@@ -238,9 +297,11 @@ mod tests {
         let mut s = Sampler::new().expect("GPU counters");
         let procs = s.sample();
         for p in &procs {
-            println!("{:<12} pid {:<6} shared {:.2} GB  dedicated {:.2} GB", p.app, p.pid, p.shared as f64 / GB, p.dedicated as f64 / GB);
+            let kind = if p.restartable { "restartable" } else { "watch only" };
+            println!("{:<24} pid {:<6} shared {:.2} GB  dedicated {:.2} GB  {kind}", p.app, p.pid, p.shared as f64 / GB, p.dedicated as f64 / GB);
         }
-        assert!(!procs.is_empty(), "expected at least one Chromium GPU process running");
+        assert!(procs.iter().any(|p| p.restartable), "expected at least one Chromium GPU process running");
+        assert!(procs.iter().any(|p| !p.restartable), "expected at least one other process using the GPU");
     }
 
     #[test]
@@ -248,5 +309,32 @@ mod tests {
         assert_eq!(friendly_name("opera"), "Opera");
         assert_eq!(friendly_name("MSEdge"), "Edge");
         assert_eq!(friendly_name("SomethingElse"), "SomethingElse");
+    }
+
+    /// Live: closes a long ping it started, and refuses when the name doesn't match.
+    /// (Not Notepad: on Windows 11 notepad.exe is a launcher that exits at once.)
+    #[test]
+    #[ignore]
+    fn closes_only_the_named_app() {
+        let mut child = std::process::Command::new("ping")
+            .args(["-n", "30", "127.0.0.1"])
+            .stdout(std::process::Stdio::null())
+            .spawn()
+            .expect("ping");
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        assert!(!close_app(child.id(), "Something Else"));
+        assert!(child.try_wait().unwrap().is_none(), "wrong name must not close it");
+        assert!(close_app(child.id(), "PING"));
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        assert!(child.try_wait().unwrap().is_some(), "ping should have been closed");
+    }
+
+    #[test]
+    fn never_closes_windows_itself() {
+        assert!(!closable("Desktop Window Manager"));
+        assert!(!closable("explorer"));
+        assert!(!closable("Process 1234"));
+        assert!(closable("Java"));
+        assert!(closable("Blender"));
     }
 }

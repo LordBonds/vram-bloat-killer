@@ -1,14 +1,16 @@
-//! VRAM Bloat Killer: a tray icon that watches the GPU memory of browser and app
-//! GPU processes, warns when one passes your limit, and restarts it on request
-//! (or automatically). Restarting a Chromium GPU process keeps every tab open.
+//! VRAM Bloat Killer: a tray icon that watches the GPU memory of every process,
+//! warns about bloat (browsers over a limit, apps borrowing system RAM, steady
+//! leaks), and can kill past a hard limit. A browser/Electron GPU process is
+//! restarted, which keeps every tab open; other apps are closed only if allowed.
 
 #![windows_subsystem = "windows"]
 
 mod gpu;
 mod settings;
+mod watch;
 
 use std::cell::RefCell;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
 use windows::core::{w, HSTRING, PCWSTR};
@@ -20,23 +22,26 @@ use windows::Win32::UI::Shell::*;
 use windows::Win32::UI::WindowsAndMessaging::*;
 
 use gpu::{GpuProcess, Sampler, GB};
-use settings::{Settings, LIMITS_GB};
+use settings::{Settings, COOLDOWN_MIN, GROWTH_GB, KILL_GB, WARN_GB};
+use watch::{Limits, Reason, Watch};
 
 const WM_TRAY: u32 = WM_APP + 1;
 const TRAY_ID: u32 = 1;
 const TIMER_ID: usize = 1;
 const SAMPLE_MS: u32 = 5_000;
-/// Chromium gives up on hardware acceleration if its GPU process dies too often,
-/// so automatic restarts of the same app are spaced out.
-const AUTO_COOLDOWN: Duration = Duration::from_secs(10 * 60);
+/// The same app isn't notified about more than once in this long.
+const RENOTIFY: Duration = Duration::from_secs(30 * 60);
 const MENU_ROWS: usize = 10;
-
 /// Keyboard activation of the icon; the windows crate doesn't define it.
 const NIN_KEYSELECT: u32 = NIN_SELECT | 1;
 
-const ID_RESTART: u32 = 1000;
-const ID_LIMIT: u32 = 2000;
-const ID_AUTO: u32 = 3001;
+const ID_ROW: u32 = 1000;
+const ID_WARN: u32 = 2000;
+const ID_GROWTH: u32 = 2100;
+const ID_KILL: u32 = 2200;
+const ID_KILL_OFF: u32 = 2299;
+const ID_COOLDOWN: u32 = 2300;
+const ID_KILL_APPS: u32 = 3001;
 const ID_STARTUP: u32 = 3002;
 const ID_QUIT: u32 = 3003;
 
@@ -57,13 +62,16 @@ static ICON_PNGS: [[&[u8]; 5]; 3] = [icon_set!("green"), icon_set!("amber"), ico
 struct App {
     hwnd: HWND,
     sampler: Sampler,
+    watch: Watch,
     settings: Settings,
     procs: Vec<GpuProcess>,
+    alerts: HashMap<u32, Reason>,
     icons: [HICON; 3],
     level: usize,
-    /// GPU processes already warned about; cleared once they drop back under 80% of the limit.
-    warned: HashSet<u32>,
-    last_auto: HashMap<String, Instant>,
+    /// When each app was last notified about, by pid.
+    notified: HashMap<u32, Instant>,
+    /// When each app was last auto-killed, by name so a relaunched process still waits.
+    last_kill: HashMap<String, Instant>,
     /// The process a click on the current notification restarts.
     balloon_pid: Option<u32>,
     taskbar_created: u32,
@@ -127,12 +135,14 @@ fn main() {
         let mut app = App {
             hwnd,
             sampler,
+            watch: Watch::default(),
             settings: Settings::load(),
             procs: Vec::new(),
+            alerts: HashMap::new(),
             icons: [load_icon(0), load_icon(1), load_icon(2)],
             level: 0,
-            warned: HashSet::new(),
-            last_auto: HashMap::new(),
+            notified: HashMap::new(),
+            last_kill: HashMap::new(),
             balloon_pid: None,
             taskbar_created: RegisterWindowMessageW(w!("TaskbarCreated")),
         };
@@ -168,7 +178,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                 NIN_BALLOONUSERCLICK => {
                     with_app(|app| {
                         if let Some(pid) = app.balloon_pid.take() {
-                            restart(app, pid);
+                            kill(app, pid, false);
                         }
                     });
                 }
@@ -202,51 +212,109 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
     }
 }
 
+fn limits(s: &Settings) -> Limits {
+    let bytes = |gb: f64| (gb * GB) as u64;
+    Limits { warn: bytes(s.warn_gb), growth: bytes(s.growth_gb), kill: s.kill_gb.map(bytes) }
+}
+
 fn tick(app: &mut App) {
     app.procs = app.sampler.sample();
-    let limit = (app.settings.limit_gb * GB) as u64;
-    let rearm = limit / 10 * 8;
+    let alerts = app.watch.assess(&app.procs, &limits(&app.settings));
+    app.alerts = alerts.iter().copied().collect();
+    let now = Instant::now();
     let procs = app.procs.clone();
-    app.warned.retain(|pid| procs.iter().any(|p| p.pid == *pid && p.total() >= rearm));
+    app.notified.retain(|pid, at| procs.iter().any(|p| p.pid == *pid) && at.elapsed() < RENOTIFY);
+    let cooldown = Duration::from_secs(app.settings.cooldown_min * 60);
 
-    for p in procs.iter().filter(|p| p.total() >= limit) {
-        if app.warned.contains(&p.pid) {
-            continue;
+    // A kill beats any notification; otherwise the first unnotified alert, kill-limit
+    // ones first. One action per tick; the next waits five seconds.
+    let mut alerts = alerts;
+    alerts.sort_by_key(|(_, r)| *r != Reason::OverKill);
+    let mut pending = None;
+    for (pid, reason) in alerts {
+        let Some(p) = procs.iter().find(|p| p.pid == pid) else { continue };
+        let may_kill = reason == Reason::OverKill && (p.restartable || (app.settings.kill_apps && gpu::closable(&p.app)));
+        let cooled = app.last_kill.get(&p.app).map_or(true, |t| t.elapsed() >= cooldown);
+        if may_kill && cooled {
+            app.last_kill.insert(p.app.clone(), now);
+            kill(app, pid, true);
+            return;
         }
-        app.warned.insert(p.pid);
-        let cooled = app.last_auto.get(&p.app).map_or(true, |t| t.elapsed() >= AUTO_COOLDOWN);
-        if app.settings.auto_restart && cooled {
-            app.last_auto.insert(p.app.clone(), Instant::now());
-            restart(app, p.pid);
-        } else {
-            app.balloon_pid = Some(p.pid);
-            balloon(
-                app,
-                &format!("{}'s GPU memory hit {:.1} GB", p.app, p.total_gb()),
-                "Click here to restart its GPU process. Your tabs and windows stay open.",
-                NIIF_WARNING,
-            );
+        if pending.is_none() && !app.notified.contains_key(&pid) {
+            pending = Some((p.clone(), reason, may_kill));
         }
-        // One notification per tick; the next one waits five seconds.
-        break;
+    }
+    if let Some((p, reason, cooling)) = pending {
+        app.notified.insert(p.pid, now);
+        notify(app, &p, reason, cooling);
     }
     refresh_tray_icon(app);
 }
 
-fn restart(app: &mut App, pid: u32) {
+fn notify(app: &mut App, p: &GpuProcess, reason: Reason, cooling: bool) {
+    let gb = p.total_gb();
+    let mins = app.settings.cooldown_min;
+    let (title, text) = match reason {
+        Reason::OverKill if cooling => (
+            format!("{} hit your auto-kill limit again: {gb:.1} GB", p.app),
+            if p.restartable {
+                format!("Auto-kill is waiting out its {mins}-minute cooldown. Click here to restart its GPU process now.")
+            } else {
+                format!("Auto-kill is waiting out its {mins}-minute cooldown. Save your work.")
+            },
+        ),
+        Reason::OverKill => (
+            format!("{} is holding {gb:.1} GB of GPU memory", p.app),
+            if gpu::closable(&p.app) {
+                "That's over your auto-kill limit, but closing apps other than browsers is turned off. Save your work and restart it when you can.".into()
+            } else {
+                "That's over your auto-kill limit, but it's part of Windows, so it's never closed. Restarting the PC frees it.".into()
+            },
+        ),
+        Reason::OverWarn => (
+            format!("{}'s GPU memory hit {gb:.1} GB", p.app),
+            "Click here to restart its GPU process. Your tabs and windows stay open.".into(),
+        ),
+        Reason::Borrowed => (
+            format!("{} borrowed {:.1} GB of system RAM", p.app, p.shared as f64 / GB),
+            format!("It's using it as graphics memory, which Task Manager's Memory column doesn't show. Restart {} when you can.", p.app),
+        ),
+        Reason::Growing(rise) => (
+            format!("{}'s GPU memory keeps climbing", p.app),
+            format!(
+                "Up {:.1} GB in 30 minutes without dropping back, which looks like a leak. Save your work and restart {} when you can.",
+                rise as f64 / GB,
+                p.app
+            ),
+        ),
+    };
+    app.balloon_pid = p.restartable.then_some(p.pid);
+    let icon = if reason == Reason::OverKill { NIIF_ERROR } else { NIIF_WARNING };
+    balloon(app, &title, &text, icon);
+}
+
+/// Restarts a browser/Electron GPU process, or closes any other app.
+fn kill(app: &mut App, pid: u32, auto: bool) {
     let Some(p) = app.procs.iter().find(|p| p.pid == pid).cloned() else { return };
-    if gpu::restart(pid) {
+    let gb = p.total_gb();
+    let why = if auto { ", over your auto-kill limit" } else { "" };
+    let (ok, title, text) = if p.restartable {
+        (
+            gpu::restart(pid),
+            format!("Restarted {}'s GPU process", p.app),
+            format!("It was holding {gb:.1} GB{why}. Your tabs and windows stay open."),
+        )
+    } else {
+        (gpu::close_app(pid, &p.app), format!("Closed {}", p.app), format!("It was holding {gb:.1} GB of GPU memory{why}."))
+    };
+    if ok {
         app.procs.retain(|q| q.pid != pid);
-        balloon(
-            app,
-            &format!("Restarted {}'s GPU process", p.app),
-            &format!("It was holding {:.1} GB. Your tabs and windows stay open.", p.total_gb()),
-            NIIF_INFO,
-        );
+        app.alerts.remove(&pid);
+        balloon(app, &title, &text, NIIF_INFO);
     } else {
         balloon(
             app,
-            &format!("Couldn't restart {}'s GPU process", p.app),
+            &format!("Couldn't stop {}", p.app),
             "Windows refused. It may be running as administrator; run VRAM Bloat Killer the same way.",
             NIIF_ERROR,
         );
@@ -254,40 +322,100 @@ fn restart(app: &mut App, pid: u32) {
     refresh_tray_icon(app);
 }
 
+struct MenuState {
+    rows: Vec<(u32, String, f64, bool, Option<Reason>)>,
+    warn: f64,
+    growth: f64,
+    kill: Option<f64>,
+    kill_apps: bool,
+    cooldown: u64,
+}
+
 fn show_menu(hwnd: HWND, x: i32, y: i32) {
     // Build from a snapshot so the app state isn't borrowed during the menu's modal loop.
-    let Some((rows, limit_gb, auto)) =
-        with_app(|app| (app.procs.iter().take(MENU_ROWS).map(|p| (p.pid, p.app.clone(), p.total_gb())).collect::<Vec<_>>(), app.settings.limit_gb, app.settings.auto_restart))
-    else {
+    let Some(m) = with_app(|app| MenuState {
+        rows: app
+            .procs
+            .iter()
+            .take(MENU_ROWS)
+            .map(|p| (p.pid, p.app.clone(), p.total_gb(), p.restartable, app.alerts.get(&p.pid).copied()))
+            .collect(),
+        warn: app.settings.warn_gb,
+        growth: app.settings.growth_gb,
+        kill: app.settings.kill_gb,
+        kill_apps: app.settings.kill_apps,
+        cooldown: app.settings.cooldown_min,
+    }) else {
         return;
     };
     let startup = settings::starts_with_windows();
 
     let chosen = unsafe {
         let Ok(menu) = CreatePopupMenu() else { return };
-        let add = |m: HMENU, flags: MENU_ITEM_FLAGS, id: u32, text: &str| {
-            let _ = AppendMenuW(m, flags, id as usize, &HSTRING::from(text));
+        let add = |menu: HMENU, flags: MENU_ITEM_FLAGS, id: u32, text: &str| {
+            let _ = AppendMenuW(menu, flags, id as usize, &HSTRING::from(text));
         };
-        let checked = |on: bool| if on { MF_CHECKED } else { MF_UNCHECKED };
+        let sub = |label: String, items: Vec<(u32, String, bool)>| {
+            if let Ok(s) = CreatePopupMenu() {
+                for (id, text, on) in items {
+                    add(s, MF_STRING | if on { MF_CHECKED } else { MF_UNCHECKED }, id, &text);
+                }
+                let _ = AppendMenuW(menu, MF_POPUP, s.0 as usize, &HSTRING::from(label));
+            }
+        };
+        let separator = || {
+            let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
+        };
 
-        add(menu, MF_STRING | MF_GRAYED, 0, "GPU memory by app (click to restart)");
-        if rows.is_empty() {
+        add(menu, MF_STRING | MF_GRAYED, 0, "GPU memory by app");
+        if m.rows.is_empty() {
             add(menu, MF_STRING | MF_GRAYED, 0, "    Nothing holding over 32 MB");
         }
-        for (i, (_, name, gb)) in rows.iter().enumerate() {
-            add(menu, MF_STRING, ID_RESTART + i as u32, &format!("Restart {name}'s GPU process\t{gb:.1} GB"));
-        }
-        let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
-
-        if let Ok(limits) = CreatePopupMenu() {
-            for (i, gb) in LIMITS_GB.iter().enumerate() {
-                add(limits, MF_STRING | checked(*gb == limit_gb), ID_LIMIT + i as u32, &format!("{gb} GB"));
+        for (i, (_, name, gb, restartable, alert)) in m.rows.iter().enumerate() {
+            let tag = match alert {
+                Some(Reason::OverKill) => "  [over kill limit]",
+                Some(Reason::OverWarn | Reason::Borrowed) => "  [over limit]",
+                Some(Reason::Growing(_)) => "  [climbing]",
+                None => "",
+            };
+            if *restartable {
+                add(menu, MF_STRING, ID_ROW + i as u32, &format!("Restart {name}'s GPU process{tag}\t{gb:.1} GB"));
+            } else {
+                // Closing a whole app by hand is the app's own job; this is information.
+                add(menu, MF_STRING | MF_GRAYED, 0, &format!("{name}{tag}\t{gb:.1} GB"));
             }
-            let _ = AppendMenuW(menu, MF_POPUP, limits.0 as usize, &HSTRING::from(format!("Limit per app: {limit_gb} GB")));
         }
-        add(menu, MF_STRING | checked(auto), ID_AUTO, "Restart automatically over the limit");
-        add(menu, MF_STRING | checked(startup), ID_STARTUP, "Start with Windows");
-        let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
+        separator();
+
+        sub(
+            format!("Warn above: {} GB", m.warn),
+            WARN_GB.iter().enumerate().map(|(i, g)| (ID_WARN + i as u32, format!("{g} GB"), *g == m.warn)).collect(),
+        );
+        sub(
+            format!("Leak alert: +{} GB in 30 min", m.growth),
+            GROWTH_GB.iter().enumerate().map(|(i, g)| (ID_GROWTH + i as u32, format!("+{g} GB"), *g == m.growth)).collect(),
+        );
+        let mut kills = vec![(ID_KILL_OFF, "Off".to_string(), m.kill.is_none())];
+        kills.extend(KILL_GB.iter().enumerate().map(|(i, g)| (ID_KILL + i as u32, format!("{g} GB"), Some(*g) == m.kill)));
+        sub(
+            match m.kill {
+                Some(g) => format!("Auto-kill above: {g} GB"),
+                None => "Auto-kill: off".into(),
+            },
+            kills,
+        );
+        sub(
+            format!("Auto-kill at most every: {} min", m.cooldown),
+            COOLDOWN_MIN.iter().enumerate().map(|(i, c)| (ID_COOLDOWN + i as u32, format!("{c} minutes"), *c == m.cooldown)).collect(),
+        );
+        add(
+            menu,
+            MF_STRING | if m.kill_apps { MF_CHECKED } else { MF_UNCHECKED },
+            ID_KILL_APPS,
+            "Auto-kill closes other apps too (unsaved work is lost)",
+        );
+        separator();
+        add(menu, MF_STRING | if startup { MF_CHECKED } else { MF_UNCHECKED }, ID_STARTUP, "Start with Windows");
         add(menu, MF_STRING, ID_QUIT, "Quit");
 
         // Without this the menu won't close when you click elsewhere.
@@ -298,55 +426,60 @@ fn show_menu(hwnd: HWND, x: i32, y: i32) {
         id
     };
 
+    let in_range = |id: u32, base: u32, len: usize| (base..base + len as u32).contains(&id);
+    let change = |f: &dyn Fn(&mut Settings)| {
+        with_app(|app| {
+            f(&mut app.settings);
+            app.settings.save();
+            app.notified.clear();
+            refresh_tray_icon(app);
+        });
+    };
     match chosen {
         0 => {}
         ID_QUIT => unsafe {
             let _ = DestroyWindow(hwnd);
         },
-        ID_AUTO => {
-            with_app(|app| {
-                app.settings.auto_restart = !app.settings.auto_restart;
-                app.settings.save();
-            });
-        }
         ID_STARTUP => settings::set_starts_with_windows(!startup),
-        id if (ID_LIMIT..ID_LIMIT + LIMITS_GB.len() as u32).contains(&id) => {
-            with_app(|app| {
-                app.settings.limit_gb = LIMITS_GB[(id - ID_LIMIT) as usize];
-                app.settings.save();
-                app.warned.clear();
-                refresh_tray_icon(app);
-            });
+        ID_KILL_APPS => change(&|s| s.kill_apps = !s.kill_apps),
+        ID_KILL_OFF => change(&|s| s.kill_gb = None),
+        id if in_range(id, ID_WARN, WARN_GB.len()) => change(&|s| s.warn_gb = WARN_GB[(id - ID_WARN) as usize]),
+        id if in_range(id, ID_GROWTH, GROWTH_GB.len()) => change(&|s| s.growth_gb = GROWTH_GB[(id - ID_GROWTH) as usize]),
+        id if in_range(id, ID_KILL, KILL_GB.len()) => change(&|s| s.kill_gb = Some(KILL_GB[(id - ID_KILL) as usize])),
+        id if in_range(id, ID_COOLDOWN, COOLDOWN_MIN.len()) => {
+            change(&|s| s.cooldown_min = COOLDOWN_MIN[(id - ID_COOLDOWN) as usize])
         }
-        id if (ID_RESTART..ID_RESTART + rows.len() as u32).contains(&id) => {
-            let pid = rows[(id - ID_RESTART) as usize].0;
-            with_app(|app| restart(app, pid));
+        id if in_range(id, ID_ROW, m.rows.len()) => {
+            let pid = m.rows[(id - ID_ROW) as usize].0;
+            with_app(|app| kill(app, pid, false));
         }
         _ => {}
     }
 }
 
-/// 0 green (under half the limit), 1 amber, 2 red (something is over).
+/// 0 green, 1 amber (something over half the warn limit), 2 red (an alert is active).
 fn level(app: &App) -> usize {
-    let top = app.procs.first().map_or(0.0, |p| p.total_gb());
-    if top >= app.settings.limit_gb {
-        2
-    } else if top >= app.settings.limit_gb / 2.0 {
-        1
-    } else {
-        0
+    if !app.alerts.is_empty() {
+        return 2;
     }
+    let half = app.settings.warn_gb * GB / 2.0;
+    let near = app.procs.iter().any(|p| (if p.restartable { p.total() } else { p.shared }) as f64 >= half);
+    usize::from(near)
 }
 
 fn tooltip(app: &App) -> String {
     let mut tip = String::from("VRAM Bloat Killer");
     if app.procs.is_empty() {
-        tip.push_str("\nNo app GPU memory over 32 MB");
+        tip.push_str("\nNothing holding over 32 MB");
     }
     for p in app.procs.iter().take(3) {
         tip.push_str(&format!("\n{} {:.1} GB", p.app, p.total_gb()));
     }
-    tip.push_str(&format!("\nLimit {} GB{}", app.settings.limit_gb, if app.settings.auto_restart { ", auto" } else { "" }));
+    let s = &app.settings;
+    match s.kill_gb {
+        Some(k) => tip.push_str(&format!("\nWarn {} GB, kill {k} GB", s.warn_gb)),
+        None => tip.push_str(&format!("\nWarn {} GB, auto-kill off", s.warn_gb)),
+    }
     tip
 }
 
