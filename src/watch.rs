@@ -98,7 +98,7 @@ mod tests {
     const G: u64 = 1 << 30;
 
     fn proc(restartable: bool, shared: u64, dedicated: u64) -> GpuProcess {
-        GpuProcess { pid: 1, app: "x".into(), shared, dedicated, restartable }
+        GpuProcess { pid: 1, app: "x".into(), shared, dedicated, restartable, owner: 1, protected: false }
     }
 
     fn limits() -> Limits {

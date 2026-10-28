@@ -1,6 +1,6 @@
 [package]
 name = "vram-bloat-killer"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
 description = "A Windows tray watchdog that catches GPU memory bloat in any app, and restarts browser GPU processes without closing a tab."
 license = "MIT"
@@ -12,14 +12,20 @@ version = "0.58"
 features = [
     "Wdk_System_Threading",
     "Win32_Foundation",
+    "Win32_Graphics_Dwm",
     "Win32_Graphics_Gdi",
+    "Win32_Graphics_Imaging",
     "Win32_System_Diagnostics_ToolHelp",
+    "Win32_System_Com",
     "Win32_System_LibraryLoader",
+    "Win32_System_SystemInformation",
+    "Win32_System_Time",
     "Win32_System_Performance",
     "Win32_Security",
     "Win32_System_Registry",
     "Win32_System_Threading",
     "Win32_UI_HiDpi",
+    "Win32_UI_Input_KeyboardAndMouse",
     "Win32_UI_Shell",
     "Win32_UI_WindowsAndMessaging",
 ]

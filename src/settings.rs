@@ -6,7 +6,7 @@ use std::path::PathBuf;
 use windows::core::{w, PCWSTR};
 use windows::Win32::Foundation::ERROR_SUCCESS;
 use windows::Win32::System::Registry::{
-    RegDeleteKeyValueW, RegGetValueW, RegSetKeyValueW, HKEY_CURRENT_USER, REG_SZ, RRF_RT_REG_SZ,
+    RegDeleteKeyValueW, RegGetValueW, RegSetKeyValueW, HKEY_CURRENT_USER, REG_SZ, RRF_RT_REG_DWORD, RRF_RT_REG_SZ,
 };
 
 pub const WARN_GB: [f64; 6] = [1.0, 2.0, 3.0, 4.0, 6.0, 8.0];
@@ -18,6 +18,7 @@ pub const COOLDOWN_MIN: [u64; 4] = [5, 10, 30, 60];
 const RUN_KEY: PCWSTR = w!("Software\\Microsoft\\Windows\\CurrentVersion\\Run");
 const RUN_VALUE: PCWSTR = w!("VRAM Bloat Killer");
 
+#[derive(Clone)]
 pub struct Settings {
     /// Notify above this (browsers: total GPU memory; other apps: borrowed RAM).
     pub warn_gb: f64,
@@ -29,11 +30,32 @@ pub struct Settings {
     pub kill_apps: bool,
     /// Minimum minutes between auto-kills of the same app.
     pub cooldown_min: u64,
+    /// Restart a browser's GPU process at the warn limit, at a moment you won't notice.
+    pub quiet_wipe: bool,
+    /// Hold every automatic restart and close while something is fullscreen.
+    pub game_mode: bool,
+    /// Ask other apps to close (with a countdown you can cancel) instead of killing them.
+    pub graceful: bool,
+    /// Kill an app anyway if it hasn't closed 30 seconds after being asked.
+    pub force_after: bool,
+    /// Show cards; everything still goes to the Activity window either way.
+    pub popups: bool,
 }
 
 impl Default for Settings {
     fn default() -> Self {
-        Self { warn_gb: 3.0, growth_gb: 2.0, kill_gb: None, kill_apps: false, cooldown_min: 10 }
+        Self {
+            warn_gb: 3.0,
+            growth_gb: 2.0,
+            kill_gb: None,
+            kill_apps: false,
+            cooldown_min: 10,
+            quiet_wipe: true,
+            game_mode: true,
+            graceful: true,
+            force_after: false,
+            popups: true,
+        }
     }
 }
 
@@ -49,6 +71,11 @@ impl Settings {
                 "growth_gb" => s.growth_gb = gb.filter(|g| *g > 0.0).unwrap_or(s.growth_gb),
                 "kill_gb" => s.kill_gb = gb.filter(|g| *g > 0.0),
                 "kill_apps" => s.kill_apps = v == "true",
+                "quiet_wipe" => s.quiet_wipe = v == "true",
+                "game_mode" => s.game_mode = v == "true",
+                "graceful" => s.graceful = v == "true",
+                "force_after" => s.force_after = v == "true",
+                "popups" => s.popups = v == "true",
                 "cooldown_min" => s.cooldown_min = v.parse().unwrap_or(s.cooldown_min).max(1),
                 _ => {}
             }
@@ -62,12 +89,17 @@ impl Settings {
             let _ = std::fs::create_dir_all(dir);
         }
         let text = format!(
-            "warn_gb={}\ngrowth_gb={}\nkill_gb={}\nkill_apps={}\ncooldown_min={}\n",
+            "warn_gb={}\ngrowth_gb={}\nkill_gb={}\nkill_apps={}\ncooldown_min={}\nquiet_wipe={}\ngame_mode={}\ngraceful={}\nforce_after={}\npopups={}\n",
             self.warn_gb,
             self.growth_gb,
             self.kill_gb.unwrap_or(0.0),
             self.kill_apps,
-            self.cooldown_min
+            self.cooldown_min,
+            self.quiet_wipe,
+            self.game_mode,
+            self.graceful,
+            self.force_after,
+            self.popups
         );
         let _ = std::fs::write(path, text);
     }
@@ -100,4 +132,22 @@ pub fn set_starts_with_windows(on: bool) {
             (cmd.len() * 2) as u32,
         );
     }
+}
+
+/// Windows' own setting: is the taskbar (the "system" part of the theme) light?
+pub fn light_taskbar() -> bool {
+    let mut value = 0u32;
+    let mut size = 4u32;
+    let ok = unsafe {
+        RegGetValueW(
+            HKEY_CURRENT_USER,
+            w!("Software\\Microsoft\\Windows\\CurrentVersion\\Themes\\Personalize"),
+            w!("SystemUsesLightTheme"),
+            RRF_RT_REG_DWORD,
+            None,
+            Some(&mut value as *mut u32 as _),
+            Some(&mut size),
+        )
+    };
+    ok == ERROR_SUCCESS && value == 1
 }
