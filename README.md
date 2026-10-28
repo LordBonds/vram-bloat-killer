@@ -66,17 +66,18 @@ Download `vram-bloat-killer.exe` from [Releases](../../releases) and run it. The
 
 ## Building
 
-```bash
-cargo build --release
-```
+For everyday work, `cargo build --release` is enough. For an exe you mean to share, use:
 
 ```bash
-python tools/stamp_exe.py target/release/vram-bloat-killer.exe
+python tools/build_release.py
 ```
 
-The second step writes the app icon and version info into the exe. The GNU Rust toolchain has no resource compiler, so this is done afterwards with Windows' own resource API. Run it after every build you mean to ship.
+It does three things:
+1. **Builds without your paths.** Rust normally bakes the full paths of its source files (including your home folder, and so your name) into the binary. The script remaps them to neutral ones.
+2. **Checks before stamping.** It refuses to finish if your user name or home folder is still anywhere in the exe.
+3. **Stamps the exe.** `tools/stamp_exe.py` writes the app icon and version info into it with Windows' own resource API, since the GNU toolchain has no resource compiler.
 
-It builds with either Rust Windows toolchain: MSVC (needs the Visual Studio Build Tools) or GNU (`rustup toolchain install stable-x86_64-pc-windows-gnu`, then add `+stable-x86_64-pc-windows-gnu` after `cargo`).
+It builds with either Rust Windows toolchain: MSVC (needs the Visual Studio Build Tools) or GNU (`rustup toolchain install stable-x86_64-pc-windows-gnu`, then pass `+stable-x86_64-pc-windows-gnu` to the script, or after `cargo`).
 
 To repaint the art, run `python tools/make_icons.py` for the icons (about a minute; needs Pillow, numpy and scipy) and `python tools/make_emergency_art.py` for the emergency panel.
 
